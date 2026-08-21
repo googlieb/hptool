@@ -1,0 +1,20 @@
+# Secret & Key Files
+.env
+.secrets.toml
+
+# Databases & Storage
+*.db
+hitl_queue.db
+*.pdf
+
+# Python Caches & Virtual Envs
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# IDE / OS Specific
+.vscode/
+.idea/
+.DS_Store
