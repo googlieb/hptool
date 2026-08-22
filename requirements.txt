@@ -1,19 +1,8 @@
-# Web Framework & Interface
 streamlit>=1.35.0
-
-# LLM & AI Orchestration Engine
 google-genai>=0.1.0
-
-# Vector Database & Retrieval
-pinecone-client>=3.2.0
-
-# Database & HITL State Management
+pinecone>=3.0.0
 supabase>=2.5.0
-
-# Document Ingestion & Chunking
 pypdf>=4.2.0
 langchain-text-splitters>=0.2.0
-
-# Environment & Utilities
 python-dotenv>=1.0.1
 pydantic>=2.7.0
