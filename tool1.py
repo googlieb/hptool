@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import time
 from pathlib import Path
 import streamlit as st
 from pydantic import BaseModel, Field
@@ -8,6 +9,7 @@ from google import genai
 from google.genai import types
 from pinecone import Pinecone
 from supabase import create_client, Client
+from pypdf import PdfReader
 
 # ==========================================
 # 1. BRANDING & PATH RESOLUTION
@@ -16,7 +18,6 @@ BASE_DIR = Path(__file__).parent
 LOCAL_LOGO = BASE_DIR / "logo.png"
 HP_FALLBACK_URL = "https://upload.wikimedia.org/wikipedia/commons/a/ad/HP_logo_2012.svg"
 
-# Use local logo.png if it exists, otherwise fall back to direct SVG URL
 LOGO_SRC = str(LOCAL_LOGO) if LOCAL_LOGO.exists() else HP_FALLBACK_URL
 
 st.set_page_config(
@@ -26,7 +27,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Session State Variables
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())[:8]
 
@@ -71,7 +71,7 @@ class EvaluationResult(BaseModel):
     reasoning: str = Field(..., description="Detailed technical rationale for the assigned scores.")
 
 # ==========================================
-# 4. RAG & AI JUDGE CORE PIPELINE
+# 4. RAG, INGESTION & AI JUDGE PIPELINE
 # ==========================================
 def contextualize_query(user_input: str) -> str:
     """Rewrites follow-up user questions into standalone queries using chat history."""
@@ -124,11 +124,123 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
             text = meta.get("text", meta.get("content", ""))
             source = meta.get("source", "HP Manual")
             page = meta.get("page", "N/A")
-            formatted_contexts.append(f"[Document {i} | Source: {source} (Page {page})]\n{text}")
+            pdf_url = meta.get("pdf_url", "")
+            
+            source_info = f"Source: {source} (Page {page})"
+            if pdf_url:
+                source_info += f" | Link: {pdf_url}"
+                
+            formatted_contexts.append(f"[Document {i} | {source_info}]\n{text}")
             
         return "\n\n---\n\n".join(formatted_contexts)
     except Exception as e:
         return f"Pinecone Search Error: {str(e)}"
+
+def upload_pdf_to_supabase(uploaded_file, filename: str) -> str:
+    """Uploads original PDF binary to Supabase Storage bucket ('manuals') and returns public URL."""
+    if not supabase:
+        return ""
+    
+    try:
+        uploaded_file.seek(0)
+        file_bytes = uploaded_file.read()
+        storage_path = f"manuals/{uuid.uuid4().hex[:8]}_{filename}"
+        
+        supabase.storage.from_("manuals").upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/pdf", "x-upsert": "true"}
+        )
+        
+        return supabase.storage.from_("manuals").get_public_url(storage_path)
+    except Exception as e:
+        st.warning(f"Note: Could not archive PDF in Supabase Storage ({str(e)}). Proceeding with vector upsert.")
+        return ""
+
+def extract_text_from_pdf(uploaded_file) -> list[tuple[int, str]]:
+    """Extracts text page by page from an uploaded PDF file."""
+    uploaded_file.seek(0)
+    reader = PdfReader(uploaded_file)
+    pages_text = []
+    for page_num, page in enumerate(reader.pages, 1):
+        extracted = page.extract_text()
+        if extracted and len(extracted.strip()) > 20:
+            pages_text.append((page_num, extracted.strip()))
+    return pages_text
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
+    """Splits raw manual text into overlapping character chunks."""
+    chunks = []
+    start = 0
+    text_len = len(text)
+    
+    while start < text_len:
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk.strip())
+        start += chunk_size - overlap
+        
+    return [c for c in chunks if len(c) > 30]
+
+def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int = 10, page_num: int = None, pdf_url: str = ""):
+    """Chunks, embeds with Gemini, and upserts vectors into Pinecone with visual progress tracking and rich metadata."""
+    if not pc or not gemini_client:
+        st.error("Pinecone or Gemini API client not initialized.")
+        return
+
+    index = pc.Index(INDEX_NAME)
+    chunks = chunk_text(raw_text)
+    total_chunks = len(chunks)
+
+    if total_chunks == 0:
+        st.warning("No valid text extracted for processing.")
+        return
+
+    st.info(f"Generated **{total_chunks}** text chunks for ingestion from `{source_name}`.")
+    
+    progress_bar = st.progress(0.0, text="Initializing ingestion pipeline...")
+    status_text = st.empty()
+
+    vectors_to_upsert = []
+    
+    for idx, chunk in enumerate(chunks, 1):
+        status_text.text(f"Embedding chunk {idx}/{total_chunks} via Gemini API...")
+        
+        try:
+            embed_resp = gemini_client.models.embed_content(
+                model="text-embedding-004",
+                contents=chunk
+            )
+            embedding_vector = embed_resp.embedding.values
+            
+            vector_id = f"{source_name}_chunk_{idx}_{uuid.uuid4().hex[:6]}"
+            metadata = {
+                "text": chunk,
+                "source": source_name,
+                "chunk_index": idx,
+                "total_chunks": total_chunks,
+                "page": page_num if page_num else "N/A",
+                "pdf_url": pdf_url,
+                "ingested_at": str(time.strftime("%Y-%m-%d %H:%M:%S"))
+            }
+            
+            vectors_to_upsert.append({"id": vector_id, "values": embedding_vector, "metadata": metadata})
+
+            if len(vectors_to_upsert) >= batch_size or idx == total_chunks:
+                status_text.text(f"Upserting batch to Pinecone index `{INDEX_NAME}`...")
+                index.upsert(vectors=vectors_to_upsert)
+                vectors_to_upsert = []
+
+            progress_ratio = float(idx / total_chunks)
+            progress_bar.progress(progress_ratio, text=f"Processed {idx} of {total_chunks} chunks ({int(progress_ratio * 100)}%)")
+
+        except Exception as e:
+            st.error(f"Error processing chunk {idx}: {str(e)}")
+            return
+
+    status_text.empty()
+    progress_bar.progress(1.0, text="Ingestion & Vector Upsert Complete!")
+    st.success(f"Successfully indexed **{total_chunks}** chunks into Pinecone for `{source_name}`!")
 
 def run_ai_judge_evaluation(query: str, context: str, draft_response: str) -> dict:
     """Executes deterministic 3-metric evaluation using Gemini Structured Output."""
@@ -199,7 +311,6 @@ def log_to_supabase_hitl(query: str, draft_response: str, eval_data: dict):
 # ==========================================
 # 5. STREAMLIT UI LAYOUT & BRANDING
 # ==========================================
-# Sidebar Branding
 st.sidebar.image(LOGO_SRC, width=70)
 st.sidebar.title("HP Ops Panel")
 st.sidebar.caption(f"Session ID: `{st.session_state.session_id}`")
@@ -211,7 +322,6 @@ if st.sidebar.button("Clear Chat Memory"):
     st.session_state.messages = [st.session_state.messages[0]]
     st.rerun()
 
-# Main Header with Logo
 col_logo, col_title = st.columns([1, 12])
 with col_logo:
     st.image(LOGO_SRC, width=55)
@@ -221,7 +331,7 @@ with col_title:
 
 st.markdown("---")
 
-tab_chat, tab_admin = st.tabs(["Technician Copilot", "Support Admin Portal"])
+tab_chat, tab_ingest, tab_admin = st.tabs(["Technician Copilot", "Ingest Manuals", "Support Admin Portal"])
 
 # ------------------------------------------
 # TAB 1: TECHNICIAN COPILOT (CHAT)
@@ -296,7 +406,52 @@ with tab_chat:
                 })
 
 # ------------------------------------------
-# TAB 2: SUPPORT ADMIN PORTAL
+# TAB 2: INGEST MANUALS (DYNAMIC VECTOR DATABASE)
+# ------------------------------------------
+with tab_ingest:
+    st.header("Technical Manual Ingestion Engine")
+    st.markdown("Upload HP PDF service manuals, troubleshooting guides, or text documentation to update the Pinecone vector database in real-time.")
+
+    ingest_source = st.radio("Select Input Method:", ["Upload Manual File (.pdf, .txt, .md)", "Direct Text Input"], horizontal=True)
+
+    if ingest_source == "Upload Manual File (.pdf, .txt, .md)":
+        uploaded_file = st.file_uploader("Upload HP Technical Document", type=["pdf", "txt", "md"])
+        if uploaded_file is not None:
+            filename = uploaded_file.name
+            st.info(f"File selected: `{filename}`")
+            
+            if st.button("Start Ingestion Pipeline", type="primary"):
+                pdf_public_url = ""
+                
+                if filename.lower().endswith(".pdf"):
+                    with st.spinner("Archiving original PDF in Supabase Storage..."):
+                        pdf_public_url = upload_pdf_to_supabase(uploaded_file, filename)
+                    
+                    with st.spinner("Extracting text pages from PDF..."):
+                        pdf_pages = extract_text_from_pdf(uploaded_file)
+                    
+                    if not pdf_pages:
+                        st.error("Could not extract readable text from PDF. Ensure it is not an image-only scan.")
+                    else:
+                        st.success(f"Extracted {len(pdf_pages)} text pages from PDF.")
+                        combined_text = "\n\n".join([f"--- Page {num} ---\n{text}" for num, text in pdf_pages])
+                        process_and_upsert_manual(combined_text, filename, pdf_url=pdf_public_url)
+                else:
+                    raw_text = uploaded_file.read().decode("utf-8")
+                    process_and_upsert_manual(raw_text, filename)
+
+    else:
+        source_filename = st.text_input("Document Name / Identifier:", value="HP_LaserJet_Enterprise_Service_Guide")
+        manual_text = st.text_area("Paste Technical Documentation Content:", height=250, placeholder="Paste service manual procedures, pinout diagrams, error code tables, or disassembly steps...")
+
+        if st.button("Start Chunking & Vector Upsert", type="primary"):
+            if not manual_text.strip():
+                st.warning("Please provide technical manual content before starting the upsert process.")
+            else:
+                process_and_upsert_manual(manual_text, source_filename)
+
+# ------------------------------------------
+# TAB 3: SUPPORT ADMIN PORTAL
 # ------------------------------------------
 with tab_admin:
     st.header("Human-In-The-Loop (HITL) Review Queue")
