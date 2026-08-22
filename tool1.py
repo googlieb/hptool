@@ -39,25 +39,37 @@ if "messages" not in st.session_state:
     ]
 
 # ==========================================
-# 2. CLIENT & SECRETS MANAGEMENT
+# 2. SECURE CLIENT INITIALIZATION
 # ==========================================
-GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
-PINECONE_KEY = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY"))
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL"))
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY"))
+@st.cache_resource
+def init_clients():
+    """Retrieves API keys safely from st.secrets first, with os.getenv fallback."""
+    gemini_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+    pinecone_key = st.secrets.get("PINECONE_API_KEY") or os.getenv("PINECONE_API_KEY")
+    supabase_url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
+    supabase_key = st.secrets.get("SUPABASE_KEY") or os.getenv("SUPABASE_KEY")
 
-missing_keys = []
-if not GEMINI_KEY: missing_keys.append("GEMINI_API_KEY")
-if not PINECONE_KEY: missing_keys.append("PINECONE_API_KEY")
-if not SUPABASE_URL: missing_keys.append("SUPABASE_URL")
-if not SUPABASE_KEY: missing_keys.append("SUPABASE_KEY")
+    missing = []
+    if not gemini_key: missing.append("GEMINI_API_KEY")
+    if not pinecone_key: missing.append("PINECONE_API_KEY")
+    
+    # Initialize Clients
+    g_client = genai.Client(api_key=gemini_key) if gemini_key else None
+    p_client = Pinecone(api_key=pinecone_key) if pinecone_key else None
+    
+    s_client = None
+    if supabase_url and supabase_key:
+        try:
+            s_client = create_client(supabase_url, supabase_key)
+        except Exception as e:
+            st.warning(f"Supabase connection notice: {e}")
+
+    return g_client, p_client, s_client, missing
+
+gemini_client, pc, supabase, missing_keys = init_clients()
 
 if missing_keys:
     st.sidebar.error(f"Missing Secrets: {', '.join(missing_keys)}")
-
-gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-pc = Pinecone(api_key=PINECONE_KEY) if PINECONE_KEY else None
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 INDEX_NAME = "hp-manuals"
 
@@ -105,6 +117,7 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
         return "Vector database or Embedding API unavailable."
     
     try:
+        # Normalized SDK Call
         embed_resp = gemini_client.models.embed_content(
             model="text-embedding-004",
             contents=query_text
@@ -136,14 +149,14 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
     except Exception as e:
         return f"Pinecone Search Error: {str(e)}"
 
-def upload_pdf_to_supabase(uploaded_file, filename: str) -> str:
-    """Uploads original PDF binary to Supabase Storage bucket ('manuals') and returns public URL."""
+def upload_pdf_to_supabase(uploaded_file_obj, filename: str) -> str:
+    """Uploads original PDF binary to Supabase Storage with a non-blocking fallback."""
     if not supabase:
         return ""
     
     try:
-        uploaded_file.seek(0)
-        file_bytes = uploaded_file.read()
+        uploaded_file_obj.seek(0)
+        file_bytes = uploaded_file_obj.read()
         storage_path = f"manuals/{uuid.uuid4().hex[:8]}_{filename}"
         
         supabase.storage.from_("manuals").upload(
@@ -154,13 +167,14 @@ def upload_pdf_to_supabase(uploaded_file, filename: str) -> str:
         
         return supabase.storage.from_("manuals").get_public_url(storage_path)
     except Exception as e:
+        # Non-blocking warning logs the RLS error but allows vector ingestion to proceed
         st.warning(f"Note: Could not archive PDF in Supabase Storage ({str(e)}). Proceeding with vector upsert.")
         return ""
 
-def extract_text_from_pdf(uploaded_file) -> list[tuple[int, str]]:
+def extract_text_from_pdf(uploaded_file_obj) -> list[tuple[int, str]]:
     """Extracts text page by page from an uploaded PDF file."""
-    uploaded_file.seek(0)
-    reader = PdfReader(uploaded_file)
+    uploaded_file_obj.seek(0)
+    reader = PdfReader(uploaded_file_obj)
     pages_text = []
     for page_num, page in enumerate(reader.pages, 1):
         extracted = page.extract_text()
@@ -182,8 +196,8 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str
         
     return [c for c in chunks if len(c) > 30]
 
-def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int = 10, page_num: int = None, pdf_url: str = ""):
-    """Chunks, embeds with Gemini, and upserts vectors into Pinecone with visual progress tracking and rich metadata."""
+def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int = 100, page_num: int = None, pdf_url: str = ""):
+    """Chunks, embeds with Gemini, and upserts vectors into Pinecone using optimized batch sizes."""
     if not pc or not gemini_client:
         st.error("Pinecone or Gemini API client not initialized.")
         return
@@ -207,6 +221,7 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
         status_text.text(f"Embedding chunk {idx}/{total_chunks} via Gemini API...")
         
         try:
+            # Normalized SDK Call preventing 404
             embed_resp = gemini_client.models.embed_content(
                 model="text-embedding-004",
                 contents=chunk
@@ -226,6 +241,7 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
             
             vectors_to_upsert.append({"id": vector_id, "values": embedding_vector, "metadata": metadata})
 
+            # Better Batching: Writes groups of 100 to Pinecone
             if len(vectors_to_upsert) >= batch_size or idx == total_chunks:
                 status_text.text(f"Upserting batch to Pinecone index `{INDEX_NAME}`...")
                 index.upsert(vectors=vectors_to_upsert)
