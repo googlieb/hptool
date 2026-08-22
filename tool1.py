@@ -1,362 +1,261 @@
-import json
 import os
-from dotenv import load_dotenv
+import json
+import streamlit as st
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from pinecone import Pinecone
-import streamlit as st
+from supabase import create_client, Client
 
-# Automatically load local .env file if available
-load_dotenv()
-
-INDEX_NAME = "hp-supplies-rag"
-
+# ==========================================
+# 1. INITIALIZE CLIENTS & SECRETS
+# ==========================================
 st.set_page_config(
-    page_title="HP Technical & Supplies RAG Assistant",
-    page_icon="🖨️",
-    layout="wide",
+    page_title="HP Field Ops Copilot",
+    page_icon="🔧",
+    layout="wide"
 )
 
-# ------------------------------------------------------------------------------
-# 1. SESSION STATE INITIALIZATION
-# ------------------------------------------------------------------------------
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
+# Fetch secrets from st.secrets or local environment
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+PINECONE_KEY = st.secrets.get("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY"))
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL"))
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY"))
+
+# Initialize SDK Clients
+gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+pc = Pinecone(api_key=PINECONE_KEY) if PINECONE_KEY else None
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
+
+INDEX_NAME = "hp-manuals"
 
 
-# ------------------------------------------------------------------------------
-# 2. HELPER & PINECONE FUNCTIONS
-# ------------------------------------------------------------------------------
-def resolve_api_keys():
-    """Safe resolution of keys across .env, environment variables, and st.secrets."""
-    g_key = os.getenv("GEMINI_API_KEY", "")
-    p_key = os.getenv("PINECONE_API_KEY", "")
+# ==========================================
+# 2. STRUCTURED AI JUDGE SCHEMA
+# ==========================================
+class EvaluationResult(BaseModel):
+    groundedness: float = Field(..., description="Score 0.0 to 1.0 indicating if answer is strictly grounded in retrieved context.")
+    relevancy: float = Field(..., description="Score 0.0 to 1.0 indicating if response answers the user's explicit question.")
+    compliance: float = Field(..., description="Score 0.0 to 1.0 indicating adherence to HP safety standards and formatting.")
+    reasoning: str = Field(..., description="Brief summary explaining the rationale behind scores.")
 
+
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
+def query_pinecone(query_text: str, top_k: int = 3) -> str:
+    """Retrieves relevant text snippets from Pinecone index using Gemini embeddings."""
+    if not pc or not gemini_client:
+        return "Pinecone or Gemini API key missing. Unable to perform vector retrieval."
+    
     try:
-        if not g_key:
-            g_key = st.secrets.get("GEMINI_API_KEY", "")
-        if not p_key:
-            p_key = st.secrets.get("PINECONE_API_KEY", "")
-    except Exception:
-        pass
-
-    return g_key, p_key
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_indexed_models(pinecone_key: str) -> list[str]:
-    """Queries Pinecone index to dynamically retrieve detected printer models/series."""
-    if not pinecone_key or not pinecone_key.strip():
-        return []
-
-    try:
-        pc = Pinecone(api_key=pinecone_key.strip())
-        index = pc.Index(INDEX_NAME)
-
-        res = index.query(
-            vector=[0.1] * 768,
-            top_k=100,
-            include_metadata=True,
+        # Generate query embedding using Gemini
+        embed_resp = gemini_client.models.embed_content(
+            model="text-embedding-004",
+            contents=query_text
         )
-
-        models = set()
-        for match in res.get("matches", []):
-            metadata = match.get("metadata", {})
-            model_name = metadata.get("model") or metadata.get("source")
-            if model_name:
-                models.add(model_name)
-
-        return sorted(list(models))
-    except Exception:
-        return []
+        query_vector = embed_resp.embedding.values
+        
+        index = pc.Index(INDEX_NAME)
+        results = index.query(vector=query_vector, top_k=top_k, include_metadata=True)
+        
+        contexts = [match["metadata"].get("text", "") for match in results.get("matches", []) if "metadata" in match]
+        return "\n\n".join(contexts) if contexts else "No relevant HP technical context found in vector database."
+    except Exception as e:
+        return f"Retrieval Error: {str(e)}"
 
 
-def get_pinecone_context(
-    query: str,
-    gemini_key: str,
-    pinecone_key: str,
-    model_filter: str = "All Printer Models",
-    top_k: int = 5,
-) -> list[dict]:
-    """Retrieves context chunks with rich source metadata and optional model filtering."""
-    genai_client = genai.Client(api_key=gemini_key.strip())
-    emb_res = genai_client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=query,
-        config=types.EmbedContentConfig(output_dimensionality=768),
-    )
-    query_vector = emb_res.embeddings[0].values
-
-    pc = Pinecone(api_key=pinecone_key.strip())
-    index = pc.Index(INDEX_NAME)
-
-    query_filter = None
-    if model_filter and model_filter != "All Printer Models":
-        query_filter = {"model": {"$eq": model_filter}}
-
-    results = index.query(
-        vector=query_vector,
-        top_k=top_k,
-        include_metadata=True,
-        filter=query_filter,
-    )
-
-    retrieved_docs = []
-    for match in results.get("matches", []):
-        retrieved_docs.append({
-            "source": match["metadata"].get("source", "Unknown PDF"),
-            "model": match["metadata"].get("model", "Generic HP Hardware"),
-            "score": round(match["score"], 4),
-            "text": match["metadata"].get("text", ""),
-        })
-    return retrieved_docs
-
-
-# ------------------------------------------------------------------------------
-# 3. AI JUDGE / GUARDRAIL EVALUATION FUNCTION
-# ------------------------------------------------------------------------------
-def run_ai_judge_evaluation(
-    query: str, context_docs: list[dict], gemini_key: str
-) -> dict:
-    """Evaluates the retrieved context against the user query for relevance and sufficiency.
-
-    Returns JSON with score (0-100), decision ('PASS'/'WARN'), and reasoning.
-    """
-    if not context_docs:
-        return {
-            "score": 0,
-            "verdict": "FAIL",
-            "reasoning": "No documents retrieved from Pinecone index.",
-        }
-
-    context_summary = "\n\n".join([
-        f"Doc {i+1} [{doc['model']}]: {doc['text'][:300]}..."
-        for i, doc in enumerate(context_docs)
-    ])
-
+def evaluate_response(query: str, context: str, draft_response: str) -> dict:
+    """Evaluates draft response against Groundedness, Relevancy, and Compliance."""
     judge_prompt = f"""
-You are an impartial AI Quality & Safety Judge evaluating a RAG pipeline.
-Analyze the user query and the retrieved documentation chunks below. Determine if the documentation contains sufficient, relevant technical information to accurately answer the user query.
+    You are an expert AI Safety Judge for HP Field Operations.
+    Evaluate the proposed technical response strictly based on the provided Context and Query.
 
-USER QUERY: "{query}"
+    User Query: {query}
+    Retrieved Context: {context}
+    Proposed Response: {draft_response}
 
-RETRIEVED CONTEXT CHUNKS:
-{context_summary}
-
-Respond ONLY with a valid JSON object matching this exact schema:
-{{
-  "score": <integer from 0 to 100 representing relevance confidence>,
-  "verdict": "<'PASS' if score >= 60 else 'WARN'>",
-  "reasoning": "<1-2 sentence explanation of why the context is or isn't sufficient>"
-}}
-"""
-
+    Provide precise scores between 0.0 and 1.0 for groundedness, relevancy, and compliance.
+    """
+    
     try:
-        genai_client = genai.Client(api_key=gemini_key.strip())
-        response = genai_client.models.generate_content(
-            model="gemini-3.6-flash",
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
             contents=judge_prompt,
             config=types.GenerateContentConfig(
-                response_mime_type="application/json"
+                response_mime_type="application/json",
+                response_schema=EvaluationResult,
+                temperature=0.0,
             ),
         )
-        eval_result = json.loads(response.text)
-        return eval_result
+        
+        result = json.loads(response.text)
+        # Weighted Composite Score Calculation
+        composite = round(
+            (result["groundedness"] * 0.4) + (result["relevancy"] * 0.3) + (result["compliance"] * 0.3),
+            2
+        )
+        result["composite_score"] = composite
+        return result
     except Exception as e:
+        # Fallback evaluation if judge fails
         return {
-            "score": 50,
-            "verdict": "WARN",
-            "reasoning": f"AI Judge evaluation skipped due to parsing error: {e}",
+            "groundedness": 0.0, "relevancy": 0.0, "compliance": 0.0,
+            "composite_score": 0.0, "reasoning": f"Evaluation error: {str(e)}"
         }
 
 
-def generate_rag_response(
-    query: str,
-    context_docs: list[dict],
-    chat_history: list[dict],
-    gemini_key: str,
-    judge_result: dict,
-) -> str:
-    """Synthesizes answer using retrieved docs, chat history, and judge evaluations."""
-    context_blocks = []
-    for doc in context_docs:
-        context_blocks.append(
-            f"PRINTER MODEL: {doc['model']}\n"
-            f"DOCUMENT SOURCE: {doc['source']} (Relevance Score: {doc['score']})\n"
-            f"CONTENT:\n{doc['text']}"
-        )
-    formatted_context = "\n\n=========================================\n\n".join(
-        context_blocks
-    )
-
-    history_text = ""
-    if chat_history:
-        recent_history = chat_history[-6:]
-        history_text = "\n".join(
-            [f"{msg['role'].upper()}: {msg['content']}" for msg in recent_history]
-        )
-
-    judge_note = (
-        f"[AI JUDGE EVALUATION: Context Confidence Score = {judge_result.get('score', 0)}%, Verdict = {judge_result.get('verdict', 'UNKNOWN')}]. "
-        f"Judge Reasoning: {judge_result.get('reasoning', 'None')}"
-    )
-
-    system_instruction = (
-        "SYSTEM ROLE AND INSTRUCTIONS:\n"
-        "You are the official HP Enterprise Technical & Supplies Assistant.\n"
-        "Your purpose is to assist engineers, support staff, and account teams with HP hardware specifications, "
-        "yield guides, supply part numbers, and troubleshooting procedures.\n\n"
-        "OPERATIONAL RULES:\n"
-        "1. Identify printer/hardware models explicitly whenever cited in the retrieved context.\n"
-        "2. If the AI Judge Verdict is 'WARN' or context confidence is low, explicitly warn the user that retrieved documentation may be incomplete.\n"
-        "3. Use CONVERSATION HISTORY to resolve follow-up questions or pronouns (e.g., 'What is its page yield?').\n"
-        "4. If the retrieved context genuinely lacks the answer, clearly state what information is present versus what is missing.\n\n"
-        f"AI JUDGE ASSESSMENT:\n{judge_note}\n\n"
-        f"RETRIEVED DOCUMENT CONTEXT:\n{formatted_context}\n\n"
-        f"RECENT CONVERSATION HISTORY:\n{history_text if history_text else 'No previous context.'}"
-    )
-
-    genai_client = genai.Client(api_key=gemini_key.strip())
-    response = genai_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=f"{system_instruction}\n\nCURRENT USER QUESTION: {query}",
-    )
-    return response.text
+def push_to_supabase_hitl(query: str, draft_response: str, eval_data: dict):
+    """Pushes low-confidence responses (< 0.75) to Supabase hitl_review_queue."""
+    if not supabase:
+        st.warning("Supabase connection missing. Record could not be saved to queue.")
+        return
+    
+    record = {
+        "user_query": query,
+        "draft_response": draft_response,
+        "confidence_score": eval_data.get("composite_score", 0.0),
+        "groundedness_score": eval_data.get("groundedness", 0.0),
+        "relevancy_score": eval_data.get("relevancy", 0.0),
+        "compliance_score": eval_data.get("compliance", 0.0),
+        "status": "PENDING"
+    }
+    
+    try:
+        supabase.table("hitl_review_queue").insert(record).execute()
+    except Exception as e:
+        st.error(f"Failed to record HITL event in Supabase: {str(e)}")
 
 
-# ------------------------------------------------------------------------------
-# 4. STREAMLIT UI LAYOUT
-# ------------------------------------------------------------------------------
-st.title("🖨️ HP Technical & Supplies RAG Assistant")
-st.caption(
-    "Enterprise AI Knowledge Engine with Built-In AI Judge Guardrails"
-)
+# ==========================================
+# 4. STREAMLIT APPLICATION INTERFACE
+# ==========================================
+st.title("🔧 HP Field Ops Copilot v2.1")
+st.markdown("---")
 
-env_gemini_key, env_pinecone_key = resolve_api_keys()
+# Navigation Tabs
+tab_tech, tab_admin = st.tabs(["👨‍🔧 Technician Copilot", "🛡️ Support Admin Portal"])
 
-with st.sidebar:
-    st.header("🔑 Credentials")
-    gemini_api_key = st.text_input(
-        "Gemini API Key", value=env_gemini_key, type="password"
-    )
-    pinecone_api_key = st.text_input(
-        "Pinecone API Key", value=env_pinecone_key, type="password"
-    )
-
-    st.divider()
-
-    st.header("🎯 Knowledge Scope & Filters")
-
-    indexed_models = []
-    if pinecone_api_key and pinecone_api_key.strip():
-        indexed_models = get_indexed_models(pinecone_api_key.strip())
-
-    if indexed_models:
-        st.success(f"📚 {len(indexed_models)} Active Item(s) in Vector Catalog")
-        selected_model = st.selectbox(
-            "Filter Search by Hardware Model:",
-            ["All Printer Models"] + indexed_models,
-        )
-
-        with st.expander("📋 Active Hardware Index"):
-            for model_item in indexed_models:
-                st.markdown(f"- **{model_item}**")
-    else:
-        selected_model = "All Printer Models"
-        if not pinecone_api_key or not pinecone_api_key.strip():
-            st.info(
-                "Enter Pinecone API Key to load dynamic hardware model catalog."
-            )
+# ------------------------------------------
+# TAB 1: TECHNICIAN COPILOT
+# ------------------------------------------
+with tab_tech:
+    st.header("Search Technical Manuals")
+    
+    query = st.text_input("Describe the issue or error code:", placeholder="e.g., Error 13.00.00 Jam in Top Cover")
+    
+    if st.button("Run Diagnostic Search", type="primary"):
+        if not query.strip():
+            st.warning("Please enter a technical query.")
         else:
-            st.warning(
-                "Connected to Pinecone, but no vectors or 'model' metadata were found. Run `ingest_pinecone.py` to index documents."
-            )
+            with st.spinner("Searching HP Technical Database & Evaluating..."):
+                # 1. Retrieve Context
+                context = query_pinecone(query)
+                
+                # 2. Generate Initial Response
+                gen_prompt = f"""
+                You are the HP Field Ops Copilot. Answer the technician's question using ONLY the provided context.
+                If the context does not contain enough info, state clearly that official documentation is missing.
 
-    st.divider()
-    st.header("⚖️ AI Guardrail Architecture")
-    st.markdown(
-        "**AI Judge Active:** Every query passes through a secondary evaluation stage to score context relevance before final synthesis."
-    )
-
-    st.divider()
-    st.header("⚙️ Controls")
-
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state["chat_history"] = []
-        st.rerun()
-
-# Render Chat Messages
-for message in st.session_state["chat_history"]:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-# Chat Input Interface
-if prompt := st.chat_input("Ask about HP printer models, specs, or supplies..."):
-    if not gemini_api_key or not pinecone_api_key:
-        st.error("Please provide Gemini and Pinecone API keys in the sidebar.")
-    else:
-        st.session_state["chat_history"].append(
-            {"role": "user", "content": prompt}
-        )
-        with st.chat_message("user"):
-            st.write(prompt)
-
-        with st.chat_message("assistant"):
-            try:
-                # Step 1: Retrieval
-                with st.spinner("1/3 Searching Pinecone vector index..."):
-                    context_docs = get_pinecone_context(
-                        query=prompt,
-                        gemini_key=gemini_api_key,
-                        pinecone_key=pinecone_api_key,
-                        model_filter=selected_model,
-                    )
-
-                # Step 2: AI Judge Evaluation
-                with st.spinner(
-                    "2/3 AI Judge evaluating context relevance & safety..."
-                ):
-                    judge_eval = run_ai_judge_evaluation(
-                        prompt, context_docs, gemini_api_key
-                    )
-
-                # Display AI Judge Status Badge
-                score = judge_eval.get("score", 0)
-                verdict = judge_eval.get("verdict", "WARN")
-                reasoning = judge_eval.get("reasoning", "")
-
-                if verdict == "PASS":
-                    st.success(
-                        f"🟢 **AI Judge:** Context Confidence High ({score}%) | *{reasoning}*"
-                    )
-                else:
+                Context: {context}
+                Query: {query}
+                """
+                
+                draft_resp = gemini_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=gen_prompt
+                ).text
+                
+                # 3. AI Judge Evaluation
+                eval_data = evaluate_response(query, context, draft_resp)
+                score = eval_data["composite_score"]
+                
+                # Display Retreived Context (Collapsible)
+                with st.expander("📄 View Retrieved Context (Pinecone)"):
+                    st.write(context)
+                
+                # 4. Intercept Check (< 0.75 Cutoff)
+                if score < 0.75:
+                    st.error("⚠️ **Low Confidence Intercept Triggered**")
                     st.warning(
-                        f"🟡 **AI Judge:** Context Confidence Moderate/Low ({score}%) | *{reasoning}*"
+                        f"This answer received a confidence score of **{score:.2f} / 1.00** (Cutoff: 0.75).\n\n"
+                        "To prevent field errors, this query has been automatically routed to the "
+                        "**HP Support Admin Queue** for human verification."
                     )
+                    
+                    # Display breakdown
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Groundedness", f"{eval_data['groundedness']:.2f}")
+                    c2.metric("Relevancy", f"{eval_data['relevancy']:.2f}")
+                    c3.metric("Compliance", f"{eval_data['compliance']:.2f}")
+                    
+                    st.caption(f"**Judge Rationale:** {eval_data['reasoning']}")
+                    
+                    # Push to Supabase HITL Queue
+                    push_to_supabase_hitl(query, draft_resp, eval_data)
+                
+                else:
+                    st.success(f"✅ **Verified Solution (Confidence: {score:.2f})**")
+                    st.markdown(draft_resp)
+                    
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Groundedness", f"{eval_data['groundedness']:.2f}")
+                    c2.metric("Relevancy", f"{eval_data['relevancy']:.2f}")
+                    c3.metric("Compliance", f"{eval_data['compliance']:.2f}")
 
-                # Step 3: Synthesis
-                with st.spinner("3/3 Synthesizing grounded response..."):
-                    with st.expander("📄 View Retrieved Document Sources"):
-                        for doc in context_docs:
-                            st.markdown(
-                                f"**Model:** `{doc['model']}` | **Source:** `{doc['source']}` | **Score:** `{doc['score']}`"
-                            )
-                            st.caption(doc["text"][:300] + "...")
-                            st.divider()
-
-                    answer = generate_rag_response(
-                        query=prompt,
-                        context_docs=context_docs,
-                        chat_history=st.session_state["chat_history"],
-                        gemini_key=gemini_api_key,
-                        judge_result=judge_eval,
-                    )
-
-                    st.write(answer)
-
-                    st.session_state["chat_history"].append(
-                        {"role": "assistant", "content": answer}
-                    )
-
-            except Exception as e:
-                st.error(f"Error processing query: {e}")
+# ------------------------------------------
+# TAB 2: SUPPORT ADMIN PORTAL
+# ------------------------------------------
+with tab_admin:
+    st.header("Human-In-The-Loop (HITL) Review Queue")
+    
+    if not supabase:
+        st.warning("Supabase client is not connected.")
+    else:
+        if st.button("Refresh Queue"):
+            st.rerun()
+            
+        try:
+            # Query pending items from Supabase
+            response = supabase.table("hitl_review_queue").select("*").eq("status", "PENDING").execute()
+            records = response.data
+            
+            if not records:
+                st.info("🎉 No pending reviews in the queue! All systems operational.")
+            else:
+                st.write(f"**{len(records)}** items requiring human review:")
+                
+                for item in records:
+                    with st.expander(f"⚠️ Query: {item['user_query']} (Score: {item['confidence_score']:.2f})"):
+                        st.write(f"**Flagged Draft Response:**\n{item['draft_response']}")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        col1.write(f"**Groundedness:** {item['groundedness_score']}")
+                        col2.write(f"**Relevancy:** {item['relevancy_score']}")
+                        col3.write(f"**Compliance:** {item['compliance_score']}")
+                        
+                        edited_resp = st.text_area(
+                            "Corrected Response (Admin Edit):",
+                            value=item['draft_response'],
+                            key=f"edit_{item['id']}"
+                        )
+                        
+                        c_approve, c_reject = st.columns(2)
+                        
+                        if c_approve.button("Approve & Resolve", key=f"app_{item['id']}"):
+                            supabase.table("hitl_review_queue").update({
+                                "status": "APPROVED",
+                                "draft_response": edited_resp
+                            }).eq("id", item['id']).execute()
+                            st.success("Record approved and updated!")
+                            st.rerun()
+                            
+                        if c_reject.button("Reject Ticket", key=f"rej_{item['id']}"):
+                            supabase.table("hitl_review_queue").update({
+                                "status": "REJECTED"
+                            }).eq("id", item['id']).execute()
+                            st.warning("Ticket rejected.")
+                            st.rerun()
+                            
+        except Exception as e:
+            st.error(f"Error fetching queue from Supabase: {str(e)}")
