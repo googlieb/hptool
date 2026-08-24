@@ -549,19 +549,27 @@ with tab_database:
             
         try:
             files = supabase.storage.from_("manuals").list()
-            valid_files = [f for f in files if f.get("name") and f.get("name") != ".emptyFolder"]
+            
+            # Guard against None returned by empty bucket or RLS restrictions
+            if files is None:
+                files = []
+            
+            valid_files = []
+            for f in files:
+                # Support both dict and object formats from supabase SDK
+                name = f.get("name") if isinstance(f, dict) else getattr(f, "name", "")
+                if name and name != ".emptyFolder":
+                    valid_files.append(f)
             
             if valid_files:
                 st.success(f"Found {len(valid_files)} documents in the 'manuals' repository:")
                 for f in valid_files:
-                    file_name = f.get("name", "Unknown File")
-                    created_at = f.get("created_at", "Unknown Date")
+                    file_name = f.get("name") if isinstance(f, dict) else getattr(f, "name", "Unknown File")
+                    created_at = f.get("created_at") if isinstance(f, dict) else getattr(f, "created_at", "")
                     
-                    # Format the creation date if it exists
-                    display_date = created_at[:10] if len(created_at) >= 10 else created_at
-                    
+                    display_date = str(created_at)[:10] if created_at and len(str(created_at)) >= 10 else "N/A"
                     st.markdown(f"📄 **{file_name}** *(Archived: {display_date})*")
             else:
-                st.info("No files currently stored in the Supabase 'manuals' bucket.")
+                st.info("No files currently stored in the Supabase 'manuals' bucket (or access is restricted by RLS).")
         except Exception as e:
             st.warning(f"Could not retrieve file list from Supabase Storage: {str(e)}")
