@@ -53,8 +53,14 @@ def init_clients():
     if not gemini_key: missing.append("GEMINI_API_KEY")
     if not pinecone_key: missing.append("PINECONE_API_KEY")
     
-    # Initialize Clients
-    g_client = genai.Client(api_key=gemini_key) if gemini_key else None
+    # Initialize Gemini Client explicitly targeting stable v1 API
+    g_client = None
+    if gemini_key:
+      g_client = genai.Client(
+    api_key=gemini_key,
+    http_options=types.HttpOptions(api_version="v1")
+)
+
     p_client = Pinecone(api_key=pinecone_key) if pinecone_key else None
     
     s_client = None
@@ -117,9 +123,8 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
         return "Vector database or Embedding API unavailable."
     
     try:
-        # Normalized SDK Call
         embed_resp = gemini_client.models.embed_content(
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             contents=query_text
         )
         query_vector = embed_resp.embedding.values
@@ -167,7 +172,6 @@ def upload_pdf_to_supabase(uploaded_file_obj, filename: str) -> str:
         
         return supabase.storage.from_("manuals").get_public_url(storage_path)
     except Exception as e:
-        # Non-blocking warning logs the RLS error but allows vector ingestion to proceed
         st.warning(f"Note: Could not archive PDF in Supabase Storage ({str(e)}). Proceeding with vector upsert.")
         return ""
 
@@ -221,9 +225,8 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
         status_text.text(f"Embedding chunk {idx}/{total_chunks} via Gemini API...")
         
         try:
-            # Normalized SDK Call preventing 404
             embed_resp = gemini_client.models.embed_content(
-                model="text-embedding-004",
+                model="gemini-embedding-001",
                 contents=chunk
             )
             embedding_vector = embed_resp.embedding.values
@@ -241,7 +244,6 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
             
             vectors_to_upsert.append({"id": vector_id, "values": embedding_vector, "metadata": metadata})
 
-            # Better Batching: Writes groups of 100 to Pinecone
             if len(vectors_to_upsert) >= batch_size or idx == total_chunks:
                 status_text.text(f"Upserting batch to Pinecone index `{INDEX_NAME}`...")
                 index.upsert(vectors=vectors_to_upsert)
@@ -347,7 +349,6 @@ with col_title:
 
 st.markdown("---")
 
-# Added the 4th tab for the Knowledge Base database browser
 tab_chat, tab_ingest, tab_admin, tab_database = st.tabs([
     "💬 Technician Copilot", 
     "📥 Ingest Manuals", 
@@ -556,7 +557,6 @@ with tab_database:
             
             valid_files = []
             for f in files:
-                # Support both dict and object formats from supabase SDK
                 name = f.get("name") if isinstance(f, dict) else getattr(f, "name", "")
                 if name and name != ".emptyFolder":
                     valid_files.append(f)
