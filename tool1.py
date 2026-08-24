@@ -347,7 +347,13 @@ with col_title:
 
 st.markdown("---")
 
-tab_chat, tab_ingest, tab_admin = st.tabs(["Technician Copilot", "Ingest Manuals", "Support Admin Portal"])
+# Added the 4th tab for the Knowledge Base database browser
+tab_chat, tab_ingest, tab_admin, tab_database = st.tabs([
+    "💬 Technician Copilot", 
+    "📥 Ingest Manuals", 
+    "🛡️ Support Admin Portal", 
+    "📂 Knowledge Base"
+])
 
 # ------------------------------------------
 # TAB 1: TECHNICIAN COPILOT (CHAT)
@@ -527,3 +533,35 @@ with tab_admin:
 
         except Exception as err:
             st.error(f"Error connecting to Supabase table: {str(err)}")
+
+# ------------------------------------------
+# TAB 4: KNOWLEDGE BASE BROWSER
+# ------------------------------------------
+with tab_database:
+    st.header("Archived Knowledge Base")
+    st.markdown("Browse technical manuals and documentation currently archived in the storage bucket.")
+    
+    if not supabase:
+        st.info("Supabase storage is not configured. Connect your credentials to view archived files.")
+    else:
+        if st.button("Refresh Storage List", key="refresh_db"):
+            st.rerun()
+            
+        try:
+            files = supabase.storage.from_("manuals").list()
+            valid_files = [f for f in files if f.get("name") and f.get("name") != ".emptyFolder"]
+            
+            if valid_files:
+                st.success(f"Found {len(valid_files)} documents in the 'manuals' repository:")
+                for f in valid_files:
+                    file_name = f.get("name", "Unknown File")
+                    created_at = f.get("created_at", "Unknown Date")
+                    
+                    # Format the creation date if it exists
+                    display_date = created_at[:10] if len(created_at) >= 10 else created_at
+                    
+                    st.markdown(f"📄 **{file_name}** *(Archived: {display_date})*")
+            else:
+                st.info("No files currently stored in the Supabase 'manuals' bucket.")
+        except Exception as e:
+            st.warning(f"Could not retrieve file list from Supabase Storage: {str(e)}")
