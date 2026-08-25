@@ -551,7 +551,7 @@ with tab_chat:
                 
                 try:
                     gen_response = gemini_client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.6-flash",
                         contents=generation_prompt
                     )
                     draft_answer = gen_response.text
