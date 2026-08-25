@@ -188,6 +188,10 @@ def expand_query_with_llm(user_query: str) -> str:
     except Exception:
         return user_input
 
+def contextualize_query(user_query: str) -> str:
+    """Wrapper function mapping legacy contextualize calls to LLM query expansion."""
+    return expand_query_with_llm(user_query)
+
 import re
 
 def query_pinecone_vector_db(query_text: str, top_k: int = 6) -> str:
@@ -562,8 +566,7 @@ with tab_chat:
     if query_to_process:
         with st.chat_message("assistant", avatar=LOGO_SRC):
             with st.spinner("Processing manual vector search & running AI Judge evaluation..."):
-                search_query = contextualize_query(query_to_process)
-                retrieved_context = query_pinecone_vector_db(search_query)
+                retrieved_context = query_pinecone_vector_db(query_to_process)
                 
                 generation_prompt = f"""
 You are the HP Field Ops Copilot assisting a certified field service technician.
