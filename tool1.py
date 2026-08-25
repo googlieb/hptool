@@ -39,7 +39,7 @@ if "messages" not in st.session_state:
     ]
 
 # ==========================================
-# 2. SECURE CLIENT INITIALIZATION + HELPER FUNCTION
+# 2. SECURE CLIENT INITIALIZATION + HELPER FUNCTIONS
 # ==========================================
 @st.cache_resource
 def init_clients():
@@ -100,6 +100,33 @@ def get_embedding_values(embed_resp) -> list[float]:
 
     raise AttributeError(f"Could not extract vector values from API response: {type(embed_resp)}")
 
+def fetch_indexed_manuals_from_pinecone():
+    """Queries Pinecone vector metadata to retrieve all unique ingested manuals and their model numbers."""
+    if not pc:
+        return []
+    try:
+        index = pc.Index(INDEX_NAME)
+        # Query sample vector space to aggregate distinct ingested manual metadata
+        dummy_vector = [0.01] * 768
+        query_res = index.query(vector=dummy_vector, top_k=100, include_metadata=True)
+        matches = query_res.get("matches", [])
+        
+        manuals_map = {}
+        for match in matches:
+            meta = match.get("metadata", {})
+            source = meta.get("source")
+            if source and source not in manuals_map:
+                manuals_map[source] = {
+                    "filename": source,
+                    "model_number": meta.get("model_number", "HP Equipment"),
+                    "total_chunks": meta.get("total_chunks", "N/A"),
+                    "ingested_at": meta.get("ingested_at", "N/A"),
+                    "pdf_url": meta.get("pdf_url", "")
+                }
+        return list(manuals_map.values())
+    except Exception as e:
+        st.caption(f"Pinecone scan notice: {e}")
+        return []
 # ==========================================
 # 3. STRUCTURED AI JUDGE SCHEMAS
 # ==========================================
@@ -222,8 +249,28 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str
         
     return [c for c in chunks if len(c) > 30]
 
+def extract_hp_model_number(text_sample: str) -> str:
+    """Uses Gemini 2.5 Flash to automatically identify the HP hardware/printer model number."""
+    if not gemini_client or not text_sample:
+        return "Generic HP Equipment"
+    try:
+        prompt = (
+            "Analyze the following technical manual excerpt and extract the exact HP printer or hardware model number/series "
+            "(e.g., 'LaserJet Enterprise M607', 'PageWide Pro 477dw', 'DesignJet T1700', 'EliteBook 840 G8'). "
+            "Return ONLY the concise model name and number. If no specific model is found, return 'HP General Equipment'.\n\n"
+            f"Document Sample:\n{text_sample[:3000]}"
+        )
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        extracted = resp.text.strip().replace('"', '').replace("'", "")
+        return extracted if extracted else "HP General Equipment"
+    except Exception:
+        return "HP General Equipment"
+
 def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int = 100, page_num: int = None, pdf_url: str = ""):
-    """Chunks, embeds with Gemini, and upserts vectors into Pinecone using optimized batch sizes."""
+    """Chunks, embeds with Gemini, extracts model numbers, and upserts vectors into Pinecone."""
     if not pc or not gemini_client:
         st.error("Pinecone or Gemini API client not initialized.")
         return
@@ -236,7 +283,11 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
         st.warning("No valid text extracted for processing.")
         return
 
-    st.info(f"Generated **{total_chunks}** text chunks for ingestion from `{source_name}`.")
+    # Extract hardware model number from manual content
+    with st.spinner("Analyzing document metadata & extracting HP Model Number..."):
+        model_number = extract_hp_model_number(raw_text)
+
+    st.info(f"Identified Model: **{model_number}** | Total Chunks: **{total_chunks}** from `{source_name}`.")
     
     progress_bar = st.progress(0.0, text="Initializing ingestion pipeline...")
     status_text = st.empty()
@@ -258,6 +309,7 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
             metadata = {
                 "text": chunk,
                 "source": source_name,
+                "model_number": model_number,
                 "chunk_index": idx,
                 "total_chunks": total_chunks,
                 "page": page_num if page_num else "N/A",
@@ -281,7 +333,7 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
 
     status_text.empty()
     progress_bar.progress(1.0, text="Ingestion & Vector Upsert Complete!")
-    st.success(f"Successfully indexed **{total_chunks}** chunks into Pinecone for `{source_name}`!")
+    st.success(f"Successfully indexed **{total_chunks}** chunks into Pinecone for `{source_name}` ({model_number})!")
 
 def run_ai_judge_evaluation(query: str, context: str, draft_response: str) -> dict:
     """Executes deterministic 3-metric evaluation using Gemini Structured Output."""
@@ -563,36 +615,46 @@ with tab_admin:
 # ------------------------------------------
 with tab_database:
     st.header("Archived Knowledge Base")
-    st.markdown("Browse technical manuals and documentation currently archived in the storage bucket.")
+    st.markdown("Browse technical manuals and equipment models currently indexed in the Pinecone vector database and Supabase archive.")
     
-    if not supabase:
-        st.info("Supabase storage is not configured. Connect your credentials to view archived files.")
+    if st.button("🔄 Refresh Knowledge Base", key="refresh_kb"):
+        st.rerun()
+
+    indexed_manuals = fetch_indexed_manuals_from_pinecone()
+
+    if indexed_manuals:
+        st.subheader("Indexed Hardware Manuals in Vector DB")
+        for manual in indexed_manuals:
+            with st.container(border=True):
+                col_info, col_link = st.columns([4, 1])
+                with col_info:
+                    st.markdown(f"🖨️ **Model:** `{manual['model_number']}`")
+                    st.markdown(f"📄 **Source Document:** `{manual['filename']}`")
+                    st.caption(f"Chunks Indexed: {manual['total_chunks']} | Ingested At: {manual['ingested_at']}")
+                with col_link:
+                    if manual['pdf_url']:
+                        st.link_button("View Original PDF", manual['pdf_url'])
+                    else:
+                        st.caption("No Direct PDF Link")
     else:
-        if st.button("Refresh Storage List", key="refresh_db"):
-            st.rerun()
-            
+        st.info("No active vectors found in the Pinecone index. Ingest a manual in the 'Ingest Manuals' tab to get started.")
+
+    st.markdown("---")
+    st.subheader("Supabase Storage Archives")
+    if not supabase:
+        st.caption("Supabase storage bucket connection is offline.")
+    else:
         try:
-            files = supabase.storage.from_("manuals").list()
-            
-            # Guard against None returned by empty bucket or RLS restrictions
-            if files is None:
-                files = []
-            
-            valid_files = []
-            for f in files:
-                name = f.get("name") if isinstance(f, dict) else getattr(f, "name", "")
-                if name and name != ".emptyFolder":
-                    valid_files.append(f)
+            files = supabase.storage.from_("manuals").list() or []
+            valid_files = [f for f in files if (f.get("name") if isinstance(f, dict) else getattr(f, "name", "")) not in ["", ".emptyFolder"]]
             
             if valid_files:
-                st.success(f"Found {len(valid_files)} documents in the 'manuals' repository:")
                 for f in valid_files:
                     file_name = f.get("name") if isinstance(f, dict) else getattr(f, "name", "Unknown File")
                     created_at = f.get("created_at") if isinstance(f, dict) else getattr(f, "created_at", "")
-                    
                     display_date = str(created_at)[:10] if created_at and len(str(created_at)) >= 10 else "N/A"
-                    st.markdown(f"📄 **{file_name}** *(Archived: {display_date})*")
+                    st.markdown(f"📂 **{file_name}** *(Archived: {display_date})*")
             else:
-                st.info("No files currently stored in the Supabase 'manuals' bucket (or access is restricted by RLS).")
+                st.caption("No raw files found in Supabase 'manuals' bucket.")
         except Exception as e:
-            st.warning(f"Could not retrieve file list from Supabase Storage: {str(e)}")
+            st.caption(f"Could not retrieve Supabase file list: {str(e)}")
