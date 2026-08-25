@@ -139,10 +139,33 @@ class EvaluationResult(BaseModel):
 # ==========================================
 # 4. RAG, INGESTION & AI JUDGE PIPELINE
 # ==========================================
-def contextualize_query(user_input: str) -> str:
-    """Rewrites follow-up user questions into standalone queries using chat history."""
-    if len(st.session_state.messages) <= 2:
-        return user_input
+def expand_query_with_llm(user_query: str) -> str:
+    """Uses Gemini to dynamically expand technical terms, error families, and model names for RAG search."""
+    if not gemini_client or not user_query:
+        return user_query
+
+    prompt = f"""
+    You are an HP Technical Information Retrieval Specialist.
+    Expand the following field technician query into an optimal search string for vector database retrieval.
+
+    Rules:
+    1. If a generic error code or event log code is mentioned (e.g., '13.00.00', '50.00', '59.00'), include the parent error family (e.g., '13.XX', '50.XX') and common locations/components (e.g., fuser, tray, duplexer, roller, motor, laser).
+    2. Expand hardware model shorthand (e.g., 'M608', 'T1700', '477dw') to full product line names (e.g., 'LaserJet Enterprise M608').
+    3. Include common technical synonyms (e.g., 'jam' -> 'paper path media jam feed registration').
+    4. Output ONLY the expanded query string as plain text. No explanations.
+
+    Original Query: {user_query}
+    Expanded Search Terms:
+    """
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+        expanded = resp.text.strip()
+        return f"{user_query} {expanded}"
+    except Exception:
+        return user_query
 
     history_summary = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[-4:-1]])
     
@@ -167,54 +190,62 @@ def contextualize_query(user_input: str) -> str:
 
 import re
 
-def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
-    """Retrieves relevant manual excerpts using Hybrid Vector + Keyword Re-Ranking."""
+def query_pinecone_vector_db(query_text: str, top_k: int = 6) -> str:
+    """Performs dual-pass vector search using both raw and LLM-expanded queries with keyword re-ranking."""
     if not pc or not gemini_client:
         return "Vector database or Embedding API unavailable."
     
     try:
-        # 1. Dense Vector Embeddings Call
-        embed_resp = gemini_client.models.embed_content(
+        # Step 1: Generate expanded search terms
+        expanded_query = expand_query_with_llm(query_text)
+        
+        # Step 2: Generate embeddings for both queries
+        raw_emb_resp = gemini_client.models.embed_content(
             model="gemini-embedding-001",
             contents=query_text,
             config=types.EmbedContentConfig(output_dimensionality=768)
         )
-        query_vector = get_embedding_values(embed_resp)
+        exp_emb_resp = gemini_client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=expanded_query,
+            config=types.EmbedContentConfig(output_dimensionality=768)
+        )
         
-        # 2. Fetch a wider pool of vector candidates (top 20)
+        vec_raw = get_embedding_values(raw_emb_resp)
+        vec_exp = get_embedding_values(exp_emb_resp)
+        
+        # Step 3: Query Pinecone twice and aggregate unique matches
         index = pc.Index(INDEX_NAME)
-        results = index.query(vector=query_vector, top_k=20, include_metadata=True)
+        res_raw = index.query(vector=vec_raw, top_k=15, include_metadata=True)
+        res_exp = index.query(vector=vec_exp, top_k=15, include_metadata=True)
         
-        matches = results.get("matches", [])
+        combined_matches = {}
+        for match in res_raw.get("matches", []) + res_exp.get("matches", []):
+            m_id = match.get("id")
+            if m_id not in combined_matches or match.get("score", 0) > combined_matches[m_id].get("score", 0):
+                combined_matches[m_id] = match
+
+        matches = list(combined_matches.values())
         if not matches:
             return "No relevant HP technical documentation found in vector index."
         
-        # 3. Extract alphanumeric keywords/error codes from user query (e.g., '13.00.00', 'M608', 'RM2-5583')
+        # Step 4: Keyword re-ranking for exact alphanumeric codes
         keywords = set(re.findall(r'[A-Za-z0-9\.\-]+', query_text.lower()))
-        # Filter out common short stopwords
         keywords = {k for k in keywords if len(k) > 2 and k not in {"how", "clear", "the", "for", "error", "code", "with"}}
 
-        # 4. Hybrid Scoring: Base vector score + Keyword match boost
         scored_matches = []
         for match in matches:
             meta = match.get("metadata", {})
             text = meta.get("text", meta.get("content", "")).lower()
             base_score = match.get("score", 0.0)
             
-            # Boost score if exact error codes or part numbers appear in text
-            keyword_boost = 0.0
-            for kw in keywords:
-                if kw in text:
-                    keyword_boost += 0.20  # +20% score boost per exact token match
-            
-            final_score = base_score + keyword_boost
-            scored_matches.append((final_score, match))
+            boost = sum(0.20 for kw in keywords if kw in text)
+            scored_matches.append((base_score + boost, match))
         
-        # Sort by hybrid score and slice top_k
         scored_matches.sort(key=lambda x: x[0], reverse=True)
         top_matches = [m[1] for m in scored_matches[:top_k]]
 
-        # 5. Format contexts for Gemini context window
+        # Step 5: Format context block
         formatted_contexts = []
         for i, match in enumerate(top_matches, 1):
             meta = match.get("metadata", {})
@@ -466,9 +497,6 @@ tab_chat, tab_ingest, tab_admin, tab_database = st.tabs([
 # ------------------------------------------
 # TAB 1: TECHNICIAN COPILOT (CHAT)
 # ------------------------------------------
-# ------------------------------------------
-# TAB 1: TECHNICIAN COPILOT (CHAT)
-# ------------------------------------------
 with tab_chat:
     if "last_query" not in st.session_state:
         st.session_state.last_query = ""
@@ -538,16 +566,23 @@ with tab_chat:
                 retrieved_context = query_pinecone_vector_db(search_query)
                 
                 generation_prompt = f"""
-                You are the HP Field Ops Copilot assisting a certified field service technician.
-                Answer the technician's question accurately using ONLY the provided technical documentation.
-                If the documentation does not contain sufficient details to answer safely, explicitly state that official HP documentation is missing.
+You are the HP Field Ops Copilot assisting a certified field service technician.
+Answer the technician's question accurately using ONLY the provided technical documentation context.
 
-                Retrieved Documentation Context:
-                {retrieved_context}
+Response Guidelines:
+1. Direct Answer: If exact instructions exist for the specific error code/part, outline the step-by-step resolution clearly.
+2. Generic Code / Family Code Handling: If the user queries a generic event code (e.g., 13.00.00, 50.00.00) or if the exact sub-code is missing:
+   - State clearly that the code is a high-level/generic category code.
+   - Summarize the specific sub-codes and physical locations present in the provided context (e.g., Tray 1, Fuser area, Duplexer).
+   - Provide the general diagnostic/clearing steps for those sub-areas so the technician can proceed immediately.
+3. If no relevant technical documentation exists in the context at all, explicitly state that official HP documentation is missing.
 
-                Technician Question:
-                {query_to_process}
-                """
+Retrieved Documentation Context:
+{retrieved_context}
+
+Technician Question:
+{query_to_process}
+"""
                 
                 try:
                     gen_response = gemini_client.models.generate_content(
