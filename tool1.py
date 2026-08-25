@@ -127,6 +127,19 @@ def fetch_indexed_manuals_from_pinecone():
     except Exception as e:
         st.caption(f"Pinecone scan notice: {e}")
         return []
+
+def clear_pinecone_index() -> bool:
+    """Deletes all vector records from the active Pinecone index."""
+    if not pc:
+        st.error("Pinecone client is not initialized.")
+        return False
+    try:
+        index = pc.Index(INDEX_NAME)
+        index.delete(delete_all=True)
+        return True
+    except Exception as e:
+        st.error(f"Failed to clear Pinecone index: {str(e)}")
+        return False    
 # ==========================================
 # 3. STRUCTURED AI JUDGE SCHEMAS
 # ==========================================
@@ -316,24 +329,41 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str
         
     return [c for c in chunks if len(c) > 30]
 
-def extract_hp_model_number(text_sample: str) -> str:
-    """Uses Gemini 2.5 Flash to automatically identify the HP hardware/printer model number."""
-    if not gemini_client or not text_sample:
-        return "Generic HP Equipment"
+def extract_hp_model_number(document_text: str) -> str:
+    """Uses Gemini 3.6 Flash to extract the HP hardware model directly from page 1/2 text."""
+    if not gemini_client or not document_text.strip():
+        return "HP General Equipment"
     try:
-        prompt = (
-            "Analyze the following technical manual excerpt and extract the exact HP printer or hardware model number/series "
-            "(e.g., 'LaserJet Enterprise M607', 'PageWide Pro 477dw', 'DesignJet T1700', 'EliteBook 840 G8'). "
-            "Return ONLY the concise model name and number. If no specific model is found, return 'HP General Equipment'.\n\n"
-            f"Document Sample:\n{text_sample[:3000]}"
-        )
+        # Extract first 3500 chars (Pages 1 & 2)
+        sample = document_text[:3500]
+        
+        prompt = f"""
+        You are analyzing the cover page text of an HP technical manual or commercial document.
+        Extract the exact HP hardware product model name, series, or document title.
+
+        Examples of correct extractions:
+        - "HP LaserJet Enterprise M608"
+        - "HP PageWide Pro 477dw"
+        - "HP DesignJet T1700"
+        - "HP Federal GSA Schedule Price List"
+        - "HP EliteBook 840 G8"
+
+        Document Text Excerpt:
+        {sample}
+
+        Instructions:
+        1. Identify the core product family (LaserJet, PageWide, DesignJet, EliteBook, ProBook, ZBook, OfficeJet, DeskJet, etc.) and model numbers.
+        2. If this is a price list or schedule, return its formal document title (e.g., 'HP GSA Contract Price List').
+        3. Do NOT return standalone terms like 'User Guide', 'Edition 1', or 'Service Manual' without the model.
+        4. Output ONLY the concise model/title string as plain text. No extra commentary.
+        """
         resp = gemini_client.models.generate_content(
             model="gemini-3.6-flash",
             contents=prompt
         )
         extracted = resp.text.strip().replace('"', '').replace("'", "")
         return extracted if extracted else "HP General Equipment"
-    except Exception:
+    except Exception as e:
         return "HP General Equipment"
 
 def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int = 100, page_num: int = None, pdf_url: str = ""):
@@ -350,11 +380,14 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
         st.warning("No valid text extracted for processing.")
         return
 
-    # Extract hardware model number from manual content
-    with st.spinner("Analyzing document metadata & extracting HP Model Number..."):
+    # 1. Extract Model Number from Page 1 & 2 text
+    with st.spinner("Parsing cover page and extracting HP Model Number..."):
         model_number = extract_hp_model_number(raw_text)
 
-    st.info(f"Identified Model: **{model_number}** | Total Chunks: **{total_chunks}** from `{source_name}`.")
+    # Show technician feedback in UI
+    st.info(f"Identified Model: **{model_number}** | Total Chunks: **{total_chunks}**")
+    with st.expander("🔍 View Extracted Page 1 Sample Text"):
+        st.text(raw_text[:1500])
     
     progress_bar = st.progress(0.0, text="Initializing ingestion pipeline...")
     status_text = st.empty()
@@ -628,7 +661,7 @@ Technician Question:
 # TAB 2: INGEST MANUALS (DYNAMIC VECTOR DATABASE)
 # ------------------------------------------
 with tab_ingest:
-    st.header("Technical Manual Ingestion Engine")
+    st.header("Ingestion Engine")
     st.markdown("Upload HP PDF service manuals, troubleshooting guides, or text documentation to update the Pinecone vector database in real-time.")
 
     ingest_source = st.radio("Select Input Method:", ["Upload Manual File (.pdf, .txt, .md)", "Direct Text Input"], horizontal=True)
@@ -738,8 +771,23 @@ with tab_database:
     st.header("Archived Knowledge Base")
     st.markdown("Browse technical manuals and equipment models currently indexed in the Pinecone vector database and Supabase archive.")
     
-    if st.button("🔄 Refresh Knowledge Base", key="refresh_kb"):
-        st.rerun()
+    # Action Bar: Refresh & Clear Index
+    col_ref, col_danger = st.columns([2, 5])
+    with col_ref:
+        if st.button("🔄 Refresh Knowledge Base", use_container_width=True):
+            st.rerun()
+
+    # Maintenance Expander for Vector DB Reset
+    with st.expander("⚠️ Admin Index Management (Reset Vector DB)"):
+        st.warning("Clearing the index permanently removes all vector embeddings and extracted model metadata from Pinecone.")
+        if st.button("🗑️ Clear Entire Pinecone Index", type="primary"):
+            with st.spinner("Wiping Pinecone index..."):
+                if clear_pinecone_index():
+                    st.success("Pinecone index cleared successfully! You can now re-ingest fresh manuals.")
+                    time.sleep(1)
+                    st.rerun()
+
+    st.markdown("---")
 
     indexed_manuals = fetch_indexed_manuals_from_pinecone()
 
