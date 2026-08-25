@@ -165,12 +165,15 @@ def contextualize_query(user_input: str) -> str:
     except Exception:
         return user_input
 
+import re
+
 def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
-    """Retrieves relevant manual excerpts from Pinecone using Gemini embeddings."""
+    """Retrieves relevant manual excerpts using Hybrid Vector + Keyword Re-Ranking."""
     if not pc or not gemini_client:
         return "Vector database or Embedding API unavailable."
     
     try:
+        # 1. Dense Vector Embeddings Call
         embed_resp = gemini_client.models.embed_content(
             model="gemini-embedding-001",
             contents=query_text,
@@ -178,22 +181,50 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
         )
         query_vector = get_embedding_values(embed_resp)
         
+        # 2. Fetch a wider pool of vector candidates (top 20)
         index = pc.Index(INDEX_NAME)
-        results = index.query(vector=query_vector, top_k=top_k, include_metadata=True)
+        results = index.query(vector=query_vector, top_k=20, include_metadata=True)
         
         matches = results.get("matches", [])
         if not matches:
             return "No relevant HP technical documentation found in vector index."
         
+        # 3. Extract alphanumeric keywords/error codes from user query (e.g., '13.00.00', 'M608', 'RM2-5583')
+        keywords = set(re.findall(r'[A-Za-z0-9\.\-]+', query_text.lower()))
+        # Filter out common short stopwords
+        keywords = {k for k in keywords if len(k) > 2 and k not in {"how", "clear", "the", "for", "error", "code", "with"}}
+
+        # 4. Hybrid Scoring: Base vector score + Keyword match boost
+        scored_matches = []
+        for match in matches:
+            meta = match.get("metadata", {})
+            text = meta.get("text", meta.get("content", "")).lower()
+            base_score = match.get("score", 0.0)
+            
+            # Boost score if exact error codes or part numbers appear in text
+            keyword_boost = 0.0
+            for kw in keywords:
+                if kw in text:
+                    keyword_boost += 0.20  # +20% score boost per exact token match
+            
+            final_score = base_score + keyword_boost
+            scored_matches.append((final_score, match))
+        
+        # Sort by hybrid score and slice top_k
+        scored_matches.sort(key=lambda x: x[0], reverse=True)
+        top_matches = [m[1] for m in scored_matches[:top_k]]
+
+        # 5. Format contexts for Gemini context window
         formatted_contexts = []
-        for i, match in enumerate(matches, 1):
+        for i, match in enumerate(top_matches, 1):
             meta = match.get("metadata", {})
             text = meta.get("text", meta.get("content", ""))
             source = meta.get("source", "HP Manual")
+            model_num = meta.get("model_number", "HP Equipment")
             page = meta.get("page", "N/A")
             pdf_url = meta.get("pdf_url", "")
             
-            source_info = f"Source: {source} (Page {page})"
+            source_info = f"Model: {model_num} | Source: {source} (Page {page})"
             if pdf_url:
                 source_info += f" | Link: {pdf_url}"
                 
