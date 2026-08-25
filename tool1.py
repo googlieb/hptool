@@ -467,7 +467,7 @@ def run_ai_judge_evaluation(user_query: str, retrieved_context: str, generated_a
     """
     try:
         resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=judge_prompt
         )
         cleaned = resp.text.strip()
