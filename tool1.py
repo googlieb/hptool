@@ -146,7 +146,8 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
     try:
         embed_resp = gemini_client.models.embed_content(
             model="gemini-embedding-001",
-            contents=query_text
+            contents=query_text,
+            config=types.EmbedContentConfig(output_dimensionality=768)
         )
         query_vector = get_embedding_values(embed_resp)
         
@@ -248,7 +249,8 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
         try:
             embed_resp = gemini_client.models.embed_content(
                 model="gemini-embedding-001",
-                contents=chunk
+                contents=chunk,
+                config=types.EmbedContentConfig(output_dimensionality=768)
             )
             embedding_vector = get_embedding_values(embed_resp)
             
