@@ -466,7 +466,41 @@ tab_chat, tab_ingest, tab_admin, tab_database = st.tabs([
 # ------------------------------------------
 # TAB 1: TECHNICIAN COPILOT (CHAT)
 # ------------------------------------------
+# ------------------------------------------
+# TAB 1: TECHNICIAN COPILOT (CHAT)
+# ------------------------------------------
 with tab_chat:
+    if "last_query" not in st.session_state:
+        st.session_state.last_query = ""
+
+    # Top Action Bar: Clear & Retry
+    col_ctrl1, col_ctrl2, _ = st.columns([2, 2, 5])
+    
+    clear_clicked = col_ctrl1.button("🗑️ Clear Chat History", use_container_width=True)
+    retry_clicked = col_ctrl2.button("🔄 Retry Last Query", use_container_width=True, disabled=not st.session_state.last_query)
+
+    if clear_clicked:
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": "Welcome to **HP Field Ops Copilot**. Describe the hardware issue, error code, or service procedure you need assistance with."
+            }
+        ]
+        st.session_state.last_query = ""
+        st.session_state.active_query = None
+        st.rerun()
+
+    # Refine Last Query Expander
+    if st.session_state.last_query:
+        with st.expander("✏️ Refine & Resubmit Last Query"):
+            refined_text = st.text_area("Modify prompt before resubmitting:", value=st.session_state.last_query, key="refine_input")
+            if st.button("Resubmit Refined Query", type="primary"):
+                st.session_state.active_query = refined_text
+                st.session_state.last_query = refined_text
+                st.session_state.messages.append({"role": "user", "content": refined_text})
+                st.rerun()
+
+    # Render Chat History
     for msg in st.session_state.messages:
         avatar = LOGO_SRC if msg["role"] == "assistant" else None
         with st.chat_message(msg["role"], avatar=avatar):
@@ -479,15 +513,28 @@ with tab_chat:
                 else:
                     st.caption(f"Verified Confidence: **{score:.2f}** | Groundedness: {ev['groundedness']:.2f} | Relevancy: {ev['relevancy']:.2f} | Compliance: {ev['compliance']:.2f}")
 
-    if user_input := st.chat_input("Enter error code, symptom, or part replacement query..."):
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
+    # Determine active query execution trigger
+    query_to_process = None
 
+    if retry_clicked and st.session_state.last_query:
+        query_to_process = st.session_state.last_query
+        # Pop previous assistant answer to replace with fresh generation
+        if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+            st.session_state.messages.pop()
+    elif "active_query" in st.session_state and st.session_state.active_query:
+        query_to_process = st.session_state.active_query
+        st.session_state.active_query = None
+    elif user_input := st.chat_input("Enter error code, symptom, or part replacement query..."):
+        query_to_process = user_input
+        st.session_state.last_query = user_input
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.chat_message("user").markdown(user_input)
+
+    # Process Gemini RAG Generation & Evaluation
+    if query_to_process:
         with st.chat_message("assistant", avatar=LOGO_SRC):
             with st.spinner("Processing manual vector search & running AI Judge evaluation..."):
-                
-                search_query = contextualize_query(user_input)
+                search_query = contextualize_query(query_to_process)
                 retrieved_context = query_pinecone_vector_db(search_query)
                 
                 generation_prompt = f"""
@@ -499,16 +546,19 @@ with tab_chat:
                 {retrieved_context}
 
                 Technician Question:
-                {user_input}
+                {query_to_process}
                 """
                 
-                gen_response = gemini_client.models.generate_content(
-                    model="gemini-3.6-flash",
-                    contents=generation_prompt
-                )
-                draft_answer = gen_response.text
+                try:
+                    gen_response = gemini_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=generation_prompt
+                    )
+                    draft_answer = gen_response.text
+                except Exception as e:
+                    draft_answer = f"Gemini Generation Error: {str(e)}"
 
-                eval_data = run_ai_judge_evaluation(user_input, retrieved_context, draft_answer)
+                eval_data = run_ai_judge_evaluation(query_to_process, retrieved_context, draft_answer)
                 score = eval_data.get("composite_score", 0.0)
 
                 if score < confidence_cutoff:
@@ -520,7 +570,7 @@ with tab_chat:
                         "and has been logged to the HP Support Admin Queue for manual review.*"
                     )
                     st.error(final_output)
-                    log_to_supabase_hitl(user_input, draft_answer, eval_data)
+                    log_to_supabase_hitl(query_to_process, draft_answer, eval_data)
                 else:
                     final_output = draft_answer
                     st.markdown(final_output)
@@ -534,6 +584,7 @@ with tab_chat:
                     "content": final_output,
                     "eval": eval_data
                 })
+                st.rerun()
 
 # ------------------------------------------
 # TAB 2: INGEST MANUALS (DYNAMIC VECTOR DATABASE)
