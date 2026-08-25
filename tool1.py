@@ -39,7 +39,7 @@ if "messages" not in st.session_state:
     ]
 
 # ==========================================
-# 2. SECURE CLIENT INITIALIZATION
+# 2. SECURE CLIENT INITIALIZATION + HELPER FUNCTION
 # ==========================================
 @st.cache_resource
 def init_clients():
@@ -54,12 +54,7 @@ def init_clients():
     if not pinecone_key: missing.append("PINECONE_API_KEY")
     
     # Initialize Gemini Client explicitly targeting stable v1 API
-    g_client = None
-    if gemini_key:
-      g_client = genai.Client(
-    api_key=gemini_key,
-    http_options=types.HttpOptions(api_version="v1")
-)
+    g_client = genai.Client(api_key=gemini_key)
 
     p_client = Pinecone(api_key=pinecone_key) if pinecone_key else None
     
@@ -78,6 +73,32 @@ if missing_keys:
     st.sidebar.error(f"Missing Secrets: {', '.join(missing_keys)}")
 
 INDEX_NAME = "hp-manuals"
+
+def get_embedding_values(embed_resp) -> list[float]:
+    """Safely extracts embedding vector values from google-genai response objects."""
+    # Check for single .embedding attribute
+    if hasattr(embed_resp, "embedding") and embed_resp.embedding is not None:
+        if hasattr(embed_resp.embedding, "values"):
+            return embed_resp.embedding.values
+        return embed_resp.embedding
+    
+    # Check for plural .embeddings list attribute
+    if hasattr(embed_resp, "embeddings") and embed_resp.embeddings:
+        first_item = embed_resp.embeddings[0]
+        if hasattr(first_item, "values"):
+            return first_item.values
+        return first_item
+
+    # Fallback for dictionary responses
+    if isinstance(embed_resp, dict):
+        if "embedding" in embed_resp:
+            emb = embed_resp["embedding"]
+            return emb.get("values", emb) if isinstance(emb, dict) else emb
+        if "embeddings" in embed_resp and embed_resp["embeddings"]:
+            emb = embed_resp["embeddings"][0]
+            return emb.get("values", emb) if isinstance(emb, dict) else emb
+
+    raise AttributeError(f"Could not extract vector values from API response: {type(embed_resp)}")
 
 # ==========================================
 # 3. STRUCTURED AI JUDGE SCHEMAS
@@ -127,7 +148,7 @@ def query_pinecone_vector_db(query_text: str, top_k: int = 4) -> str:
             model="gemini-embedding-001",
             contents=query_text
         )
-        query_vector = embed_resp.embedding.values
+        query_vector = get_embedding_values(embed_resp)
         
         index = pc.Index(INDEX_NAME)
         results = index.query(vector=query_vector, top_k=top_k, include_metadata=True)
@@ -229,7 +250,7 @@ def process_and_upsert_manual(raw_text: str, source_name: str, batch_size: int =
                 model="gemini-embedding-001",
                 contents=chunk
             )
-            embedding_vector = embed_resp.embedding.values
+            embedding_vector = get_embedding_values(embed_resp)
             
             vector_id = f"{source_name}_chunk_{idx}_{uuid.uuid4().hex[:6]}"
             metadata = {
