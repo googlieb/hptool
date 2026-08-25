@@ -211,7 +211,8 @@ def upload_pdf_to_supabase(uploaded_file_obj, filename: str) -> str:
     try:
         uploaded_file_obj.seek(0)
         file_bytes = uploaded_file_obj.read()
-        storage_path = f"manuals/{uuid.uuid4().hex[:8]}_{filename}"
+        # Fixed path: Removed redundant 'manuals/' prefix inside the 'manuals' bucket
+        storage_path = f"{uuid.uuid4().hex[:8]}_{filename}"
         
         supabase.storage.from_("manuals").upload(
             path=storage_path,
@@ -223,7 +224,7 @@ def upload_pdf_to_supabase(uploaded_file_obj, filename: str) -> str:
     except Exception as e:
         st.warning(f"Note: Could not archive PDF in Supabase Storage ({str(e)}). Proceeding with vector upsert.")
         return ""
-
+    
 def extract_text_from_pdf(uploaded_file_obj) -> list[tuple[int, str]]:
     """Extracts text page by page from an uploaded PDF file."""
     uploaded_file_obj.seek(0)
