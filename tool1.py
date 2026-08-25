@@ -158,7 +158,7 @@ def contextualize_query(user_input: str) -> str:
     """
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt
         )
         return response.text.strip()
@@ -262,7 +262,7 @@ def extract_hp_model_number(text_sample: str) -> str:
             f"Document Sample:\n{text_sample[:3000]}"
         )
         resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt
         )
         extracted = resp.text.strip().replace('"', '').replace("'", "")
@@ -354,7 +354,7 @@ def run_ai_judge_evaluation(query: str, context: str, draft_response: str) -> di
     
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=judge_prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -472,7 +472,7 @@ with tab_chat:
                 """
                 
                 gen_response = gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.6-flash",
                     contents=generation_prompt
                 )
                 draft_answer = gen_response.text
